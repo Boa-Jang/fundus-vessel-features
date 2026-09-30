@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ══════════════════════════════════════════════════════════════
+# VascX weights — 2.2 GB, download separately from HuggingFace
+# ══════════════════════════════════════════════════════════════
+weights/vascx/*.pt
+weights/vascx/*.ckpt
+weights/*.pt
+
+# ══════════════════════════════════════════════════════════════
+# Pipeline outputs — never commit
+# ══════════════════════════════════════════════════════════════
+samples/output/
+output/
+compare_run/
+pipeline_run/
+# Runtime output folders (숫자 suffix 있는 것만 매치 — features/ 소스코드는 유지)
+preprocessed_[0-9]*/
+inference_[0-9]*/
+aligned_[0-9]*/
+features_[0-9]*/
+features_json_*/
+naive_[0-9]*/
+compare_[0-9]*/
+
+# Merged CSVs and per-patient JSONs
+**/features_*.csv
+**/_merged_features_*.csv
+**/*.json
+!samples/**/*.json
+!EyeLiner/**/*.json
+
+# Notebook outputs (keep code, drop outputs)
+# 실행 결과는 커밋 안 함 → nbstripout 권장
+# .ipynb 자체는 유지하되 outputs 만 clear
