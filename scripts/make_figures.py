@@ -35,6 +35,7 @@ DOCS        = _PKG_ROOT / "docs"
 PATIENT     = "SAMPLE"
 EYE         = "R"
 SQUARE_SIZE = 512
+FIG_H       = 3.6   # uniform panel height across all figures (inches)
 
 
 def _resolve_rgb_dir() -> Path:
@@ -86,14 +87,13 @@ def fig01_vascx_masks(rgb_dir: Path, inf_dir: Path):
     ves = np.array(Image.open(inf_dir / "vessels" / f"{vid}.png"))
     dsc = np.array(Image.open(inf_dir / "discs"   / f"{vid}.png"))
 
-    fig, axes = plt.subplots(1, 4, figsize=(14, 4))
-    axes[0].imshow(rgb);                      axes[0].set_title("Preprocessed RGB (512×512)")
-    axes[1].imshow(ves, cmap="gray");         axes[1].set_title("Vessels mask")
-    axes[2].imshow(_av_rgb(av));              axes[2].set_title("Artery (red) / Vein (blue)")
-    axes[3].imshow(dsc, cmap="gray");         axes[3].set_title("Optic disc mask")
+    fig, axes = plt.subplots(1, 4, figsize=(FIG_H * 4, FIG_H))
+    axes[0].imshow(rgb);              axes[0].set_title("RGB")
+    axes[1].imshow(ves, cmap="gray"); axes[1].set_title("Vessels")
+    axes[2].imshow(_av_rgb(av));      axes[2].set_title("AV")
+    axes[3].imshow(dsc, cmap="gray"); axes[3].set_title("Disc")
     for ax in axes:
         ax.axis("off")
-    fig.suptitle("Step 1 — VascX inference (per visit)", fontsize=13)
     fig.tight_layout()
     fig.savefig(DOCS / "01_vascx_masks.png", dpi=130, bbox_inches="tight")
     plt.close(fig)
@@ -113,19 +113,16 @@ def fig02_laterality(payload, rgb_dir: Path):
     first_vid = payload["features"][0]["id"]
     rgb = np.array(Image.open(rgb_dir / f"{first_vid}.png"))
 
-    fig, ax = plt.subplots(figsize=(6, 6))
+    fig, ax = plt.subplots(figsize=(FIG_H, FIG_H))
     ax.imshow(rgb)
     ax.plot([fx, dcx], [fy, dcy], color="yellow", linewidth=1.5, alpha=0.8)
-    ax.scatter(fx, fy, s=140, marker="x", color="lime", linewidths=2.5, label="fovea")
-    ax.scatter(dcx, dcy, s=140, marker="o", facecolors="none",
-               edgecolors="cyan", linewidths=2.5, label="disc")
-    ax.text((fx + dcx) / 2, (fy + dcy) / 2 - 10,
-            f"disc.x − fovea.x = {sep:+.1f}px → {eye_label}",
-            color="white", fontsize=10, ha="center",
-            bbox=dict(facecolor="black", alpha=0.6, edgecolor="none", pad=3))
+    ax.scatter(fx, fy, s=120, marker="x", color="lime", linewidths=2.2, label="fovea")
+    ax.scatter(dcx, dcy, s=120, marker="o", facecolors="none",
+               edgecolors="cyan", linewidths=2.2, label="disc")
+    ax.set_title(f"disc.x − fovea.x = {sep:+.0f}px → {eye_label}", fontsize=10)
     ax.axis("off")
-    ax.legend(loc="lower right", facecolor="black", labelcolor="white", framealpha=0.6)
-    fig.suptitle("Step 2 — Laterality from fovea / disc geometry", fontsize=13)
+    ax.legend(loc="lower right", facecolor="black", labelcolor="white",
+              framealpha=0.6, fontsize=8)
     fig.tight_layout()
     fig.savefig(DOCS / "02_laterality.png", dpi=130, bbox_inches="tight")
     plt.close(fig)
@@ -172,15 +169,13 @@ def fig03_registration(payload, rgb_dir: Path, aligned_dir: Path):
     dice = (2 * (fixed_vess & moving_vess_aligned).sum() /
             max(int(fixed_vess.sum()) + int(moving_vess_aligned.sum()), 1))
 
-    fig, axes = plt.subplots(1, 2, figsize=(11, 5.5))
+    fig, axes = plt.subplots(1, 2, figsize=(FIG_H * 2, FIG_H))
     axes[0].imshow(before)
-    axes[0].set_title("Before alignment\n(red = fixed RGB, cyan = moving RGB)")
+    axes[0].set_title("Before")
     axes[1].imshow(after)
-    axes[1].set_title(f"After alignment — vessel masks\n(red = fixed, green = aligned moving, yellow = overlap)"
-                      f"\nDice = {dice:.3f}")
+    axes[1].set_title(f"After  ·  Dice = {dice:.3f}")
     for ax in axes:
         ax.axis("off")
-    fig.suptitle("Step 3 — EyeLiner registration (first visit = fixed)", fontsize=13)
     fig.tight_layout()
     fig.savefig(DOCS / "03_registration.png", dpi=130, bbox_inches="tight")
     plt.close(fig)
@@ -193,16 +188,15 @@ def fig03_registration(payload, rgb_dir: Path, aligned_dir: Path):
 def fig04_aligned_timeline(payload, aligned_dir: Path):
     feats = payload["features"]
     n = len(feats)
-    fig, axes = plt.subplots(1, n, figsize=(3.6 * n, 4))
+    fig, axes = plt.subplots(1, n, figsize=(FIG_H * n, FIG_H))
     if n == 1:
         axes = [axes]
-    for ax, v in zip(axes, feats):
+    for i, (ax, v) in enumerate(zip(axes, feats)):
         av = np.array(Image.open(aligned_dir / "av" / f"{v['id']}.png"))
         ax.imshow(_av_rgb(av))
-        tag = "FIXED" if v == feats[0] else "aligned"
-        ax.set_title(f"{v['date'][:10]} · {tag}")
+        tag = "fixed" if i == 0 else f"visit {i + 1}"
+        ax.set_title(tag)
         ax.axis("off")
-    fig.suptitle("Step 4 — Aligned AV masks across visits (common frame)", fontsize=13)
     fig.tight_layout()
     fig.savefig(DOCS / "04_aligned_timeline.png", dpi=130, bbox_inches="tight")
     plt.close(fig)
@@ -241,21 +235,16 @@ def fig05_zones(payload, rgb_dir: Path):
         disp[mask] = disp[mask] * 0.6 + c * 0.4
     disp = disp.clip(0, 255).astype(np.uint8)
 
-    fig, ax = plt.subplots(figsize=(7, 7))
+    fig, ax = plt.subplots(figsize=(FIG_H, FIG_H))
     ax.imshow(disp)
-    ax.scatter(fx, fy, s=120, marker="x", color="white", linewidths=2, label="fovea")
-    ax.scatter(dcx, dcy, s=120, marker="o", facecolors="none",
-               edgecolors="white", linewidths=2, label="disc")
+    ax.scatter(fx, fy, s=100, marker="x", color="white", linewidths=1.8)
+    ax.scatter(dcx, dcy, s=100, marker="o", facecolors="none",
+               edgecolors="white", linewidths=1.8)
     ax.axis("off")
-    ax.legend(loc="lower right", facecolor="black", labelcolor="white", framealpha=0.6)
 
     handles = [Patch(color=np.array(c) / 255, label=n) for n, c in ZONE_COLORS.items()]
-    ax.legend(handles=[*handles,
-                       plt.Line2D([0], [0], marker="x", color="white", linestyle="", label="fovea"),
-                       plt.Line2D([0], [0], marker="o", color="white", linestyle="",
-                                  markerfacecolor="none", label="disc")],
-              loc="center left", bbox_to_anchor=(1.0, 0.5), fontsize=8, framealpha=0.9)
-    fig.suptitle("Step 5 — ETDRS 9 subfields + Wong disc zones (B / C)", fontsize=13)
+    ax.legend(handles=handles, loc="center left", bbox_to_anchor=(1.0, 0.5),
+              fontsize=7, framealpha=0.9)
     fig.tight_layout()
     fig.savefig(DOCS / "05_zones.png", dpi=130, bbox_inches="tight")
     plt.close(fig)
@@ -271,7 +260,7 @@ def fig06_features(payload, aligned_dir: Path):
     fx, fy = meta["fovea_x"], meta["fovea_y"]
     radii = list(range(10, 240, 5))
 
-    fig, (ax_mask, ax_curve) = plt.subplots(1, 2, figsize=(12, 5))
+    fig, (ax_mask, ax_curve) = plt.subplots(1, 2, figsize=(FIG_H * 2, FIG_H))
 
     fixed_vid = feats[0]["id"]
     ves = np.array(Image.open(aligned_dir / "vessels" / f"{fixed_vid}.png")) > 0
@@ -280,23 +269,22 @@ def fig06_features(payload, aligned_dir: Path):
     for r in [40, 80, 120, 160, 200]:
         ax_mask.plot(fx + r * np.cos(theta), fy + r * np.sin(theta),
                      color="cyan", linewidth=0.9, alpha=0.7)
-    ax_mask.scatter(fx, fy, s=120, marker="x", color="yellow", linewidths=2)
-    ax_mask.set_title("Fovea-centred concentric rings\non the aligned vessel skeleton")
+    ax_mask.scatter(fx, fy, s=100, marker="x", color="yellow", linewidths=1.8)
+    ax_mask.set_title("Sholl rings (fovea-centred)")
     ax_mask.axis("off")
 
-    for v in feats:
+    for i, v in enumerate(feats):
         ves = np.array(Image.open(aligned_dir / "vessels" / f"{v['id']}.png"))
         skel = clean_and_skeletonize(ves > 0)
         curve = sholl_curve(skel, fx, fy, radii)
         ax_curve.plot(radii, curve, "-o", markersize=3, linewidth=1,
-                      label=v["date"][:10])
+                      label=f"visit {i + 1}")
     ax_curve.set_xlabel("radius (px)")
     ax_curve.set_ylabel("# skeleton crossings")
-    ax_curve.set_title("Sholl curves across visits\n(one of ~241 extracted features)")
+    ax_curve.set_title("Sholl curve per visit")
     ax_curve.grid(alpha=0.3)
-    ax_curve.legend(fontsize=9)
+    ax_curve.legend(fontsize=8)
 
-    fig.suptitle("Step 6 — Feature extraction example (Sholl, fovea-centred)", fontsize=13)
     fig.tight_layout()
     fig.savefig(DOCS / "06_features.png", dpi=130, bbox_inches="tight")
     plt.close(fig)
