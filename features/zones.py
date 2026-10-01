@@ -172,6 +172,38 @@ def make_disc_zones(
             for name, (lo, hi) in zones.items()}
 
 
+# ─────────────────── Standard FOV (DD-scaled) ───────────────────
+
+STANDARD_FOV_RADIUS_DD = 3.0   # 기본 반경: 3 × DD (image-centered, macula-centered 이미지 적합)
+
+
+def make_standard_fov(
+    cx: float, cy: float,
+    disc_diameter_px: float,
+    image_shape: Tuple[int, int],
+    radius_dd: float = STANDARD_FOV_RADIUS_DD,
+) -> np.ndarray:
+    """DD 배수 반경의 원형 FOV ROI.
+
+    Whole-image feature 계산 시 환자간 **해부학 비율** 통일을 위해 사용.
+    - R = radius_dd × disc_diameter_px
+    - 환자마다 픽셀 반경은 다르지만 DD 단위 반경은 같음 → 공정한 비교
+
+    Args:
+        cx, cy: 중심 좌표 (macula-centered 이미지면 image center 추천)
+        disc_diameter_px: 이 환자의 disc 지름 (px)
+        image_shape: (H, W)
+        radius_dd: 반경을 DD 몇 배로 할지 (default 3.0)
+
+    Returns:
+        bool 2D mask
+    """
+    H, W = image_shape
+    yy, xx = np.mgrid[:H, :W]
+    R = radius_dd * disc_diameter_px
+    return (xx - cx) ** 2 + (yy - cy) ** 2 < R ** 2
+
+
 # ─────────────────── backward-compat 별칭 ───────────────────
 
 # 이전 03-features.ipynb 에서 make_etdrs_zones 이름으로 호출했지만 실제로는 DD-scaled 였음.

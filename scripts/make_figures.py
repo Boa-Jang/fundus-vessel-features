@@ -23,8 +23,10 @@ if str(_PKG_ROOT) not in sys.path:
     sys.path.insert(0, str(_PKG_ROOT))
 
 from features.zones import (
-    make_etdrs_9subfields, make_disc_zones, mm_per_px_from_disc,
+    make_etdrs_9subfields, make_disc_zones, make_standard_fov,
+    mm_per_px_from_disc,
     DEFAULT_ETDRS_RADII_MM, DEFAULT_DISC_MARGIN_ZONES,
+    STANDARD_FOV_RADIUS_DD,
 )
 from features.skeleton import clean_and_skeletonize
 from features.topology import sholl_curve
@@ -221,16 +223,87 @@ def fig03_registration(payload, rgb_dir: Path, aligned_dir: Path):
 # Figure 4 — Aligned vessel timeline
 # ─────────────────────────────────────────────────────────────────────
 
-def fig04_aligned_timeline(payload, aligned_dir: Path):
+def _overlay_fixed_vs_aligned(fixed_rgb, aligned_rgb):
+    """Red = fixed, Cyan (G+B) = aligned. Yellow = overlap."""
+    import cv2
+    fg = cv2.cvtColor(fixed_rgb,   cv2.COLOR_RGB2GRAY)
+    mg = cv2.cvtColor(aligned_rgb, cv2.COLOR_RGB2GRAY)
+    out = np.zeros((*fg.shape, 3), dtype=np.uint8)
+    out[..., 0] = fg; out[..., 1] = mg; out[..., 2] = mg
+    return out
+
+
+def fig04_aligned_timeline(payload, rgb_dir: Path, aligned_dir: Path):
+    """Four-row N-column timeline:
+        row 0 — original RGB
+        row 1 — aligned RGB (fixed for first visit, warp-on-demand for others)
+        row 2 — overlay vs fixed (red=fixed, cyan=aligned)
+        row 3 — 3xDD standardized FOV + aligned vessel mask (green) inside the circle
+    """
+    import cv2
     feats = payload["features"]
     n = len(feats)
-    fig, axes = _centered_axes(n)
-    for i, (ax, v) in enumerate(zip(axes, feats)):
-        av = np.array(Image.open(aligned_dir / "av" / f"{v['id']}.png"))
-        ax.imshow(_av_rgb(av))
-        tag = "fixed" if i == 0 else f"visit {i + 1}"
-        ax.set_title(tag)
+    fixed_vid = feats[0]["id"]
+    fixed_rgb = np.array(Image.open(rgb_dir / f"{fixed_vid}.png"))
+    H, W = fixed_rgb.shape[:2]
+    cx_img, cy_img = W // 2, H // 2
+
+    meta = payload["meta_by_eye"][EYE]
+    DD = meta["disc_diameter_px"]
+    R  = STANDARD_FOV_RADIUS_DD * DD
+    std_fov = make_standard_fov(cx_img, cy_img, DD, (H, W),
+                                 radius_dd=STANDARD_FOV_RADIUS_DD)
+
+    th = np.linspace(0, 2 * np.pi, 200)
+
+    fig, axes = plt.subplots(4, n, figsize=(3.5 * n, 13), squeeze=False)
+
+    for i, v in enumerate(feats):
+        orig = np.array(Image.open(rgb_dir / f"{v['id']}.png"))
+
+        # Row 0 — original
+        axes[0, i].imshow(orig)
+        axes[0, i].set_title(f"{v['date'][:10]}\noriginal")
+
+        # Row 1 — aligned (warp on-demand for non-fixed visits)
+        if i == 0:
+            aligned = fixed_rgb
+            tag = "FIXED"
+        else:
+            theta = _get_theta_for(v["id"])
+            aligned = cv2.warpAffine(
+                orig, theta[:2, :], (W, H),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+            ) if theta is not None else orig
+            tag = "aligned"
+        axes[1, i].imshow(aligned); axes[1, i].set_title(tag)
+
+        # Row 2 — overlay vs fixed
+        axes[2, i].imshow(_overlay_fixed_vs_aligned(fixed_rgb, aligned))
+        axes[2, i].set_title("overlay vs fixed")
+
+        # Row 3 — 3xDD FOV + aligned vessel (green inside circle)
+        vess_p = aligned_dir / "vessels" / f"{v['id']}.png"
+        if vess_p.exists():
+            vess_mask = np.array(Image.open(vess_p)) > 0
+            disp = (aligned.astype(np.float32) * 0.4).clip(0, 255).astype(np.uint8)
+            disp[std_fov] = aligned[std_fov]              # 원 안은 원본 밝기
+            vess_in_fov = vess_mask & std_fov
+            disp[vess_in_fov] = [20, 255, 20]             # vessel 초록
+        else:
+            disp = aligned.copy()
+        axes[3, i].imshow(disp)
+        axes[3, i].plot(cx_img + R * np.cos(th),
+                         cy_img + R * np.sin(th),
+                         color="orange", lw=2)
+        axes[3, i].set_title(f"{STANDARD_FOV_RADIUS_DD}xDD FOV + vessel\n(DD={DD:.0f}px, R={R:.0f}px)")
+
+    for ax in axes.flat:
         ax.axis("off")
+
+    fig.suptitle(f"Patient {PATIENT} — {EYE} eye ({n} visits)", fontsize=14)
+    plt.tight_layout()
     fig.savefig(DOCS / "04_aligned_timeline.png", dpi=130)
     plt.close(fig)
 
@@ -279,6 +352,45 @@ def fig05_zones(payload, rgb_dir: Path):
     ax.legend(handles=handles, loc="center left", bbox_to_anchor=(1.02, 0.5),
               fontsize=7, framealpha=0.9)
     fig.savefig(DOCS / "05_zones.png", dpi=130)
+    plt.close(fig)
+
+
+# ─────────────────────────────────────────────────────────────────────
+
+def fig05b_standard_fov(payload, rgb_dir: Path):
+    """3xDD image-centered FOV — used for whole-image features.
+
+    Pixel radius scales with each patient's disc diameter so the ROI covers
+    the same anatomical area across patients (fair whole-image comparison).
+    """
+    meta = payload["meta_by_eye"][EYE]
+    dd   = meta["disc_diameter_px"]
+    dcx  = meta["disc_cx"]
+    dcy  = meta["disc_cy"]
+    fx   = meta["fovea_x"]
+    fy   = meta["fovea_y"]
+
+    fixed_vid = payload["features"][0]["id"]
+    rgb = np.array(Image.open(rgb_dir / f"{fixed_vid}.png"))
+    H, W = rgb.shape[:2]
+    cx_img, cy_img = W // 2, H // 2
+
+    fig, (ax,) = _centered_axes(1, extra_right_in=0.2)
+    ax.imshow(rgb)
+
+    th = np.linspace(0, 2 * np.pi, 200)
+    R = STANDARD_FOV_RADIUS_DD * dd
+    ax.plot(cx_img + R * np.cos(th), cy_img + R * np.sin(th),
+            color="orange", lw=2.5,
+            label=f"{STANDARD_FOV_RADIUS_DD}xDD = {R:.0f}px (DD={dd:.0f}px)")
+    ax.scatter(dcx, dcy, s=100, marker="o", facecolors="none",
+               edgecolors="red", linewidths=1.8, label="disc")
+    ax.scatter(fx, fy, s=100, marker="x", color="yellow",
+               linewidths=1.8, label="fovea")
+    ax.set_title(f"Standardized FOV ({STANDARD_FOV_RADIUS_DD}xDD, image-centered)")
+    ax.axis("off"); ax.legend(fontsize=8, loc="lower right")
+
+    fig.savefig(DOCS / "05b_standard_fov.png", dpi=130)
     plt.close(fig)
 
 
@@ -344,7 +456,7 @@ def main():
     fig01_vascx_masks(rgb_dir, inf_dir);                     print("  wrote 01_vascx_masks.png")
     fig02_laterality(payload, rgb_dir);                      print("  wrote 02_laterality.png")
     fig03_registration(payload, rgb_dir, aligned_dir);       print("  wrote 03_registration.png")
-    fig04_aligned_timeline(payload, aligned_dir);            print("  wrote 04_aligned_timeline.png")
+    fig04_aligned_timeline(payload, rgb_dir, aligned_dir);   print("  wrote 04_aligned_timeline.png")
     fig05_zones(payload, rgb_dir);                           print("  wrote 05_zones.png")
     fig06_features(payload, aligned_dir);                    print("  wrote 06_features.png")
 

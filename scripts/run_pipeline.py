@@ -4,17 +4,52 @@ Reads a clinical CSV, then for each patient:
     1. Preprocess + VascX inference (7 models).
     2. Determine laterality + fovea/disc geometry + quality.
     3. EyeLiner registration (first visit = fixed, rest warped to it).
-    4. Extract ~241 features per visit.
-    5. Save patient JSON.
-    6. If --drop-masks, delete per-patient preprocessed/inference/aligned masks.
+    4. Build standardized FOV (3xDD image-centered) for whole-image features.
+    5. Extract ~241 features per visit
+       (whole-image inside whole_valid, zone/spatial inside common_valid).
+    6. Save patient JSON.
+    7. If --drop-masks, delete per-patient preprocessed/inference/aligned masks.
 
-Example (sample dataset bundled with the repo):
+────────────────────────────────────────────────────────────────────
+Examples (PowerShell)
+────────────────────────────────────────────────────────────────────
 
+[1] Sample dataset (bundled, keep masks for debugging):
     python scripts/run_pipeline.py `
       --csv samples/sample_clinical.csv `
       --src-images samples/images `
       --output-dir samples/output `
       --keep-masks
+
+[2] Full cohort (descending visit count, drop masks to save disk):
+    python scripts/run_pipeline.py `
+      --csv path/to/clinical.csv `
+      --src-images path/to/raw_images `
+      --output-dir path/to/output `
+      --drop-masks
+
+[3] Top-N patients only (debugging / partial run):
+    python scripts/run_pipeline.py ... --top-n 100 --drop-masks
+
+[4] Specific patients only (keep masks for inspection):
+    python scripts/run_pipeline.py ... --patient-ids 30221776 19219341 --keep-masks
+
+[5] Force re-extraction (ignore existing JSON):
+    python scripts/run_pipeline.py ... --force
+
+[6] Debug mode (first N patients, keep masks):
+    python scripts/run_pipeline.py ... --limit 3 --keep-masks
+
+────────────────────────────────────────────────────────────────────
+Automatic behaviour:
+  - Patient order: descending visit count (unless --patient-ids given) —
+    richest-data patients first, so an interruption still leaves the best data.
+  - Auto-resume: an existing <features_root>/<pid>.json is skipped
+    (override with --force).
+  - Cache reuse: preprocess/inference caches on disk are reused across runs.
+  - Crash recovery: safe to kill and restart — processed patients are skipped
+    automatically.
+────────────────────────────────────────────────────────────────────
 """
 from __future__ import annotations
 

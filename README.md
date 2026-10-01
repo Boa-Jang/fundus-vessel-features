@@ -47,13 +47,13 @@ First visit = fixed frame. Each later visit is matched (SuperPoint + LightGlue) 
 
 ![registration](docs/03_registration.png)
 
-### 4. Aligned masks across visits
-Every follow-up now lives in the fixed-visit coordinate system, so pixel `(x, y)` means the same anatomy at every time point.
+### 4. Aligned masks + standardized FOV across visits
+Every follow-up now lives in the fixed-visit coordinate system, so pixel `(x, y)` means the same anatomy at every time point. The bottom row shows the **3 × disc-diameter** circle (image-centred) that whole-image features use — pixel radius scales with each patient's disc, so every patient is measured over the same **anatomical** area, not the same pixel count. Vessel masks are overlaid in green inside the FOV.
 
 ![timeline](docs/04_aligned_timeline.png)
 
 ### 5. ETDRS + Wong zones in the fixed frame
-Zones are built once from the fixed visit's fovea / disc geometry; because every visit is already in the fixed frame they stay constant across time.
+Zones are built once from the fixed visit's fovea / disc geometry; because every visit is already in the fixed frame they stay constant across time. Zone / spatial features (ETDRS, Wong B/C, Sholl, FAZ, crossings) are DD-anchored by construction, so they use the natural fundus intersection as their valid mask — only whole-image aggregates (density, fractal, caliber, …) use the 3 × DD circle above.
 
 ![zones](docs/05_zones.png)
 
