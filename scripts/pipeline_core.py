@@ -1,16 +1,16 @@
-"""Shared pipeline core — 환자 단위 feature 추출.
+"""Shared pipeline core — per-patient aligned feature extraction.
 
-파이프라인 단계:
-1. Preprocess (원본 → RGB + CE, SQUARE_SIZE)
-2. VascX 추론 (7 model: quality, av, vessels, disc, fovea, discedge, odfd)
-3. Inventory 구축 (eye side, fovea, disc geometry, quality)
-4. Registration (aligned 모드) 또는 identity (naive 모드)
-5. Feature 추출 (241 features × visit)
-6. Patient JSON 저장
+Steps:
+    1. Preprocess raw image → RGB + CE at SQUARE_SIZE.
+    2. VascX inference (7 models: quality, av, vessels, disc, fovea, discedge, odfd).
+    3. Build inventory (eye side, fovea / disc geometry, quality).
+    4. EyeLiner registration — first visit = fixed, rest warped to its frame.
+    5. Feature extraction (~241 features per visit).
+    6. Save per-patient JSON.
 
-디스크 관리:
-- keep_masks=True  → 모든 mask 유지 (재분석 가능)
-- keep_masks=False → 환자 처리 후 mask 삭제 (JSON 만 남김)
+Disk management:
+    keep_masks=True  → keep every mask (preprocessed / inference / aligned) for re-analysis.
+    keep_masks=False → delete masks after the patient's JSON is written (JSON is self-contained).
 """
 from __future__ import annotations
 
@@ -18,10 +18,10 @@ import importlib
 import json
 import shutil
 import sys
-from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -29,9 +29,8 @@ import pandas as pd
 import torch
 from PIL import Image
 from scipy import ndimage as ndi
-from tqdm import tqdm
 
-# ── features/ 모듈 (같은 repo 안) ──
+# features/ is a sibling package in this repo
 _PKG_ROOT = Path(__file__).resolve().parent.parent
 if str(_PKG_ROOT) not in sys.path:
     sys.path.insert(0, str(_PKG_ROOT))
@@ -61,35 +60,28 @@ from features.crossings import crossings_features
 
 @dataclass
 class PipelineConfig:
-    """1 회 실행의 파라미터 집합."""
-    # Data / paths
+    """Parameters for one pipeline invocation."""
     csv_path: Path
-    src_images_dir: Path                # 원본 이미지 폴더
-    output_dir: Path                    # 산출물 (preprocessed / inference / aligned / features 하위 자동 생성)
+    src_images_dir: Path
+    output_dir: Path
 
-    # Model / grid
-    weights_dir: Path                   # ../weights/vascx
+    weights_dir: Path
     square_size: int = 512
     device: str = "cuda:0"
 
-    # Modes
-    mode: str = "aligned"               # "aligned" | "naive"
-    keep_masks: bool = False            # False → 환자 끝나면 mask 삭제
+    keep_masks: bool = False
 
-    # CSV 컬럼 이름 (기본은 longitudinal_final_260820_reclassified.csv 기준)
     col_patient: str = "ID"
     col_filename: str = "Filename"
     col_date: str = "LAB_DTM"
     col_shot: str = "shot"
 
-    # Filtering
-    patient_ids: Optional[List[str]] = None   # None → 전체
-    min_visits_per_eye: int = 2               # 이 이하는 스킵 (registration 불가)
+    patient_ids: Optional[List[str]] = None
+    min_visits_per_eye: int = 2
 
-    # EyeLiner
     el_size: int = 256
 
-    # 파생 경로 (post-init 에서 세팅)
+    # Derived paths (set in __post_init__)
     prep_root: Path = field(init=False)
     inference_root: Path = field(init=False)
     aligned_root: Path = field(init=False)
@@ -101,26 +93,21 @@ class PipelineConfig:
         self.output_dir = Path(self.output_dir)
         self.weights_dir = Path(self.weights_dir)
 
-        self.prep_root = self.output_dir / f"preprocessed_{self.square_size}"
+        self.prep_root      = self.output_dir / f"preprocessed_{self.square_size}"
         self.inference_root = self.output_dir / f"inference_{self.square_size}"
-        self.aligned_root = self.output_dir / f"aligned_{self.square_size}"
-        self.features_root = self.output_dir / f"features_{self.square_size}_{self.mode}"
+        self.aligned_root   = self.output_dir / f"aligned_{self.square_size}"
+        self.features_root  = self.output_dir / f"features_{self.square_size}_aligned"
 
-        for p in [self.prep_root, self.inference_root, self.features_root]:
+        for p in [self.prep_root, self.inference_root, self.aligned_root, self.features_root]:
             p.mkdir(parents=True, exist_ok=True)
-        if self.mode == "aligned":
-            self.aligned_root.mkdir(parents=True, exist_ok=True)
 
 
 # ═════════════════════════════════════════════════════════════════════
-# 1. VascX 모델 로더
+# 1. VascX model loader
 # ═════════════════════════════════════════════════════════════════════
 
 def load_vascx_models(cfg: PipelineConfig):
-    """7 개 ensemble 로드 + square_size override.
-
-    Returns: dict {"quality", "av", "vessels", "disc", "fovea", "discedge", "odfd"}.
-    """
+    """Load 7 ensembles and override their `square_size` to cfg.square_size."""
     from rtnls_inference import (
         ClassificationEnsemble, SegmentationEnsemble,
         HeatmapRegressionEnsemble, RegressionEnsemble,
@@ -145,14 +132,11 @@ def load_vascx_models(cfg: PipelineConfig):
 
 
 # ═════════════════════════════════════════════════════════════════════
-# 2. Preprocess + Inference (환자별)
+# 2. Preprocess + inference (per patient)
 # ═════════════════════════════════════════════════════════════════════
 
 def preprocess_patient(cfg: PipelineConfig, patient_id: str, rows: pd.DataFrame) -> List[str]:
-    """원본 이미지 → RGB + CE (SQUARE_SIZE).
-
-    Returns: 성공한 image id 리스트 (stem).
-    """
+    """Raw image → RGB + CE at SQUARE_SIZE. Returns the list of successful image stems."""
     from rtnls_fundusprep.preprocessor import parallel_preprocess
     pid = str(patient_id)
     rgb_dir = cfg.prep_root / pid / "rgb"
@@ -173,8 +157,8 @@ def preprocess_patient(cfg: PipelineConfig, patient_id: str, rows: pd.DataFrame)
 
 
 def infer_patient(cfg: PipelineConfig, models: dict, patient_id: str,
-                   ids: List[str], device) -> pd.DataFrame:
-    """이 환자 이미지들에 대해 7 model 추론 → per-image inventory row."""
+                  ids: List[str], device) -> dict:
+    """Run all 7 models on the patient's images."""
     from rtnls_inference.utils import decollate_batch
 
     pid = str(patient_id)
@@ -188,37 +172,35 @@ def infer_patient(cfg: PipelineConfig, models: dict, patient_id: str,
     ce_paths     = [ce_dir  / f"{i}.png" for i in ids]
     paired_paths = [(str(r), str(c)) for r, c in zip(rgb_paths, ce_paths)]
 
-    # 4-1 keypoints (RGB+CE 페어)
     df_fovea    = models["fovea"].predict_preprocessed(paired_paths, ids=ids, num_workers=2, batch_size=8)
     df_fovea.columns = ["x_fovea", "y_fovea"]
     df_discedge = models["discedge"].predict_preprocessed(paired_paths, ids=ids, num_workers=2, batch_size=8)
     df_discedge.columns = ["x_discedge", "y_discedge"]
 
-    # 4-2 scalar (RGB only)
     df_odfd = models["odfd"].predict_preprocessed([str(p) for p in rgb_paths], ids=ids, num_workers=2, batch_size=8)
     df_odfd.columns = ["v_odfd"]
 
-    # 4-3 quality (RGB only)
     dl_q = models["quality"]._make_inference_dataloader(
         [str(p) for p in rgb_paths], ids=ids, num_workers=2, preprocess=False, batch_size=16,
     )
     qids, qrows = [], []
     with torch.no_grad():
         for batch in dl_q:
-            if len(batch) == 0: continue
+            if len(batch) == 0:
+                continue
             im = batch["image"].to(device)
             q = models["quality"].predict_step(im).mean(dim=0)
             for it in decollate_batch({"id": batch["id"], "quality": q}):
-                qids.append(it["id"]); qrows.append(it["quality"].tolist())
+                qids.append(it["id"])
+                qrows.append(it["quality"].tolist())
     df_quality = pd.DataFrame(qrows, index=qids, columns=["q1", "q2", "q3"])
 
-    # 4-4 masks (paired)
     models["av"].predict_preprocessed(paired_paths, ids=ids, dest_path=inf_dir/"av",
-                                       num_workers=2, batch_size=8)
+                                      num_workers=2, batch_size=8)
     models["vessels"].predict_preprocessed(paired_paths, ids=ids, dest_path=inf_dir/"vessels",
-                                            num_workers=2, batch_size=8)
+                                           num_workers=2, batch_size=8)
     models["disc"].predict_preprocessed(paired_paths, ids=ids, dest_path=inf_dir/"discs",
-                                         num_workers=2, batch_size=8)
+                                        num_workers=2, batch_size=8)
 
     return dict(fovea=df_fovea, discedge=df_discedge, odfd=df_odfd, quality=df_quality)
 
@@ -237,7 +219,7 @@ def disc_geometry(disc_mask: np.ndarray, min_area_px: int = 50) -> dict:
         m = lab == (int(np.argmax(sizes)) + 1)
     area = float(m.sum())
     cy, cx = ndi.center_of_mass(m)
-    return dict(cx=float(cx), cy=float(cy), diameter=2.0*np.sqrt(area/np.pi),
+    return dict(cx=float(cx), cy=float(cy), diameter=2.0 * np.sqrt(area / np.pi),
                 area_px=area, found=True)
 
 
@@ -250,13 +232,15 @@ def determine_laterality(x_fovea: float, x_disc: float, W: int, min_frac: float 
 
 def build_inventory(cfg: PipelineConfig, patient_id: str, rows: pd.DataFrame,
                     inf_dfs: dict) -> pd.DataFrame:
-    """이미지별 meta row DataFrame (id, patient, eye, fovea, disc, quality, ...)."""
+    """One row per image: id, patient, eye, fovea/disc coords, quality, …"""
     pid = str(patient_id)
     inf_dir = cfg.inference_root / pid
     W = cfg.square_size
 
-    df_fovea = inf_dfs["fovea"]; df_discedge = inf_dfs["discedge"]
-    df_odfd = inf_dfs["odfd"];   df_quality = inf_dfs["quality"]
+    df_fovea    = inf_dfs["fovea"]
+    df_discedge = inf_dfs["discedge"]
+    df_odfd     = inf_dfs["odfd"]
+    df_quality  = inf_dfs["quality"]
 
     out_rows = []
     for _, r in rows.iterrows():
@@ -279,7 +263,7 @@ def build_inventory(cfg: PipelineConfig, patient_id: str, rows: pd.DataFrame,
             disc_source = "keypoint_fallback"
 
         eye, sep = determine_laterality(float(fx), dx, W)
-        q = df_quality.loc[stem].tolist() if stem in df_quality.index else [np.nan]*3
+        q = df_quality.loc[stem].tolist() if stem in df_quality.index else [np.nan] * 3
         out_rows.append({
             "id": stem, "patient": pid,
             "date": r[cfg.col_date], "shot": r.get(cfg.col_shot, 1),
@@ -293,17 +277,16 @@ def build_inventory(cfg: PipelineConfig, patient_id: str, rows: pd.DataFrame,
             "q1": q[0], "q2": q[1], "q3": q[2],
         })
     inv = pd.DataFrame(out_rows)
-    inv[cfg.col_date] if cfg.col_date in inv.columns else None
     inv["date"] = pd.to_datetime(inv["date"])
     return inv.sort_values(["eye", "date", "shot"]).reset_index(drop=True)
 
 
 # ═════════════════════════════════════════════════════════════════════
-# 4. Registration (aligned) / identity (naive)
+# 4. Registration
 # ═════════════════════════════════════════════════════════════════════
 
 def _setup_eyeliner(cfg: PipelineConfig, device):
-    """Local EyeLiner + lightglue 임포트."""
+    """Import the vendored EyeLiner + LightGlue and build an `EyeLinerP`."""
     el_root = _PKG_ROOT / "EyeLiner"
     if str(el_root) not in sys.path:
         sys.path.insert(0, str(el_root))
@@ -321,7 +304,7 @@ def _prep_tensor(img_np, size, device):
 
 
 def _rescale_theta(theta_256, H, W, size):
-    S = np.array([[W/size,0,0],[0,H/size,0],[0,0,1]], dtype=np.float64)
+    S = np.array([[W/size, 0, 0], [0, H/size, 0], [0, 0, 1]], dtype=np.float64)
     return S @ theta_256 @ np.linalg.inv(S)
 
 
@@ -332,17 +315,12 @@ def warp_image(img, theta, H, W, is_mask=False):
 
 
 def register_group(cfg: PipelineConfig, eyeliner, device, visits: List[dict],
-                    patient_id: str, eye: str) -> List[dict]:
-    """(patient, eye) 그룹의 visit 들을 첫 방문 기준 정렬.
-
-    aligned 모드: 실제 EyeLiner 로 theta 계산, mask warp 저장.
-    naive 모드: 모두 identity theta, mask 는 inference 폴더 그대로 사용.
-    """
+                   patient_id: str, eye: str) -> List[dict]:
+    """Align every follow-up visit in a (patient, eye) group to the first visit."""
     pid = str(patient_id)
-    if cfg.mode == "aligned":
-        out_dir = cfg.aligned_root / pid / eye
-        for tag in ["av", "vessels", "discs"]:
-            (out_dir / tag).mkdir(parents=True, exist_ok=True)
+    out_dir = cfg.aligned_root / pid / eye
+    for tag in ["av", "vessels", "discs"]:
+        (out_dir / tag).mkdir(parents=True, exist_ok=True)
 
     inf_dir = cfg.inference_root / pid
     rgb_dir = cfg.prep_root / pid / "rgb"
@@ -352,23 +330,14 @@ def register_group(cfg: PipelineConfig, eyeliner, device, visits: List[dict],
     fixed = visits[0]
     fixed_rgb = np.array(Image.open(rgb_dir / f"{fixed['id']}.png"))
 
-    # fixed 는 identity
-    if cfg.mode == "aligned":
-        for tag in ["av", "vessels", "discs"]:
-            src = inf_dir / tag / f"{fixed['id']}.png"
-            if src.exists():
-                Image.open(src).save(out_dir / tag / f"{fixed['id']}.png",
-                                      format="PNG", optimize=True)
+    for tag in ["av", "vessels", "discs"]:
+        src = inf_dir / tag / f"{fixed['id']}.png"
+        if src.exists():
+            Image.open(src).save(out_dir / tag / f"{fixed['id']}.png",
+                                 format="PNG", optimize=True)
     records.append({**fixed, "is_fixed": True, "n_kp": np.nan,
                     "theta": np.eye(3).flatten().tolist()})
 
-    if cfg.mode == "naive":
-        for v in visits[1:]:
-            records.append({**v, "is_fixed": False, "n_kp": np.nan,
-                            "theta": np.eye(3).flatten().tolist()})
-        return records
-
-    # aligned: 나머지 visit registration
     for v in visits[1:]:
         moving_rgb = np.array(Image.open(rgb_dir / f"{v['id']}.png"))
         try:
@@ -379,16 +348,17 @@ def register_group(cfg: PipelineConfig, eyeliner, device, visits: List[dict],
             theta = _rescale_theta(theta, W, W, cfg.el_size)
             n_kp = cache["kp_fixed"].shape[1]
         except Exception as e:
-            print(f"  [{pid}/{eye}] {v['id']} registration 실패: {e}")
+            print(f"  [{pid}/{eye}] {v['id']} registration failed: {e}")
             continue
 
         for tag in ["av", "vessels", "discs"]:
             src = inf_dir / tag / f"{v['id']}.png"
-            if not src.exists(): continue
+            if not src.exists():
+                continue
             m = np.array(Image.open(src))
             wm = warp_image(m, theta, W, W, is_mask=True)
             Image.fromarray(wm).save(out_dir / tag / f"{v['id']}.png",
-                                       format="PNG", optimize=True)
+                                     format="PNG", optimize=True)
         records.append({**v, "is_fixed": False, "n_kp": int(n_kp),
                         "theta": theta.flatten().tolist()})
     return records
@@ -398,37 +368,34 @@ def register_group(cfg: PipelineConfig, eyeliner, device, visits: List[dict],
 # 5. Zones + common_valid + feature extraction
 # ═════════════════════════════════════════════════════════════════════
 
-def _fundus_valid(rgb): return rgb.sum(-1) > 10
+def _fundus_valid(rgb):
+    return rgb.sum(-1) > 10
 
 
 def build_zones_and_valid(cfg: PipelineConfig, patient_id: str, eye: str,
-                           reg_records: List[dict], inv: pd.DataFrame) -> Tuple[dict, np.ndarray, dict]:
-    """Fixed visit 기준으로 zones + 모든 visit 교집합 common_valid.
-
-    Returns: (zones, common_valid, meta)
-    """
+                          reg_records: List[dict], inv: pd.DataFrame) -> Tuple[Optional[dict], Optional[np.ndarray], Optional[dict]]:
+    """Build fixed-frame zones + common_valid (intersection across visits)."""
     pid = str(patient_id)
     W = cfg.square_size
-    grp_inv = inv[(inv["eye"] == eye)].copy()
+    grp_inv = inv[inv["eye"] == eye].copy()
     if len(grp_inv) == 0:
         return None, None, None
 
     fixed = reg_records[0]
-    fx = float(fixed["x_fovea"]); fy = float(fixed["y_fovea"])
-    dcx = float(fixed["x_disc"]); dcy = float(fixed["y_disc"])
-    dd_grp = float(grp_inv["disc_diameter"].mean())
-    mpp = mm_per_px_from_disc(dd_grp)
+    fx, fy   = float(fixed["x_fovea"]), float(fixed["y_fovea"])
+    dcx, dcy = float(fixed["x_disc"]),  float(fixed["y_disc"])
+    dd_grp   = float(grp_inv["disc_diameter"].mean())
+    mpp      = mm_per_px_from_disc(dd_grp)
 
     etdrs  = make_etdrs_9subfields(fx, fy, eye, mpp, (W, W), DEFAULT_ETDRS_RADII_MM)
     disc_z = make_disc_zones(dcx, dcy, dd_grp, (W, W), DEFAULT_DISC_MARGIN_ZONES)
-    zones = {**etdrs, **disc_z}
+    zones  = {**etdrs, **disc_z}
 
-    # common_valid — 모든 visit 의 fundus 유효 영역 교집합
     common = np.ones((W, W), dtype=bool)
-    for i, v in enumerate(reg_records):
+    for v in reg_records:
         rgb = np.array(Image.open(cfg.prep_root / pid / "rgb" / f"{v['id']}.png"))
-        theta = np.array(v["theta"], dtype=np.float64).reshape(3, 3)
-        if cfg.mode == "aligned" and not v.get("is_fixed", False):
+        if not v.get("is_fixed", False):
+            theta = np.array(v["theta"], dtype=np.float64).reshape(3, 3)
             rgb = warp_image(rgb, theta, W, W)
         common &= _fundus_valid(rgb)
 
@@ -437,23 +404,17 @@ def build_zones_and_valid(cfg: PipelineConfig, patient_id: str, eye: str,
     return zones, common, meta
 
 
-def _mask_dir_for_visit(cfg: PipelineConfig, pid: str, eye: str, tag: str) -> Path:
-    """Mode 에 따라 mask 파일 위치."""
-    if cfg.mode == "aligned":
-        return cfg.aligned_root / pid / eye / tag
-    return cfg.inference_root / pid / tag
-
-
 def extract_features_for_visit(cfg: PipelineConfig, pid: str, eye: str, visit: dict,
-                                zones: dict, valid: np.ndarray, group_meta: dict) -> Optional[dict]:
-    """단일 visit 의 241 features 계산."""
+                               zones: dict, valid: np.ndarray, group_meta: dict) -> Optional[dict]:
+    """Compute all ~241 features for a single visit."""
     W = cfg.square_size
     vid = visit["id"]
+    aligned_mask_dir = cfg.aligned_root / pid / eye
     try:
         rgb_base = np.array(Image.open(cfg.prep_root / pid / "rgb" / f"{vid}.png"))
-        vs_m = np.array(Image.open(_mask_dir_for_visit(cfg, pid, eye, "vessels") / f"{vid}.png"))
-        av_m = np.array(Image.open(_mask_dir_for_visit(cfg, pid, eye, "av")      / f"{vid}.png"))
-        dc_m = np.array(Image.open(_mask_dir_for_visit(cfg, pid, eye, "discs")   / f"{vid}.png"))
+        vs_m = np.array(Image.open(aligned_mask_dir / "vessels" / f"{vid}.png"))
+        av_m = np.array(Image.open(aligned_mask_dir / "av"      / f"{vid}.png"))
+        dc_m = np.array(Image.open(aligned_mask_dir / "discs"   / f"{vid}.png"))
     except FileNotFoundError:
         return None
 
@@ -465,14 +426,13 @@ def extract_features_for_visit(cfg: PipelineConfig, pid: str, eye: str, visit: d
         dd_v = float(group_meta["disc_diameter_px"])
         mpp_v = float(group_meta["mm_per_px"])
 
-    # aligned: RGB 도 warp (color feature 정확도)
-    if cfg.mode == "aligned" and not visit.get("is_fixed", False):
+    if not visit.get("is_fixed", False):
         theta = np.array(visit["theta"], dtype=np.float64).reshape(3, 3)
         rgb_a = warp_image(rgb_base, theta, W, W)
     else:
         rgb_a = rgb_base
 
-    fx, fy = group_meta["fovea_x"], group_meta["fovea_y"]
+    fx, fy   = group_meta["fovea_x"], group_meta["fovea_y"]
     dcx, dcy = group_meta["disc_cx"], group_meta["disc_cy"]
 
     w_dens   = whole_image_density_features(vs_m, av_m, dc_m, valid_mask=valid)
@@ -511,25 +471,29 @@ def extract_features_for_visit(cfg: PipelineConfig, pid: str, eye: str, visit: d
 # ═════════════════════════════════════════════════════════════════════
 
 def _json_default(o):
-    if isinstance(o, (np.integer,)): return int(o)
-    if isinstance(o, (np.floating,)):
+    if isinstance(o, np.integer):
+        return int(o)
+    if isinstance(o, np.floating):
         v = float(o)
         return None if not np.isfinite(v) else v
-    if isinstance(o, np.ndarray): return o.tolist()
-    if isinstance(o, pd.Timestamp): return o.isoformat()
-    if isinstance(o, (Path,)): return str(o)
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    if isinstance(o, pd.Timestamp):
+        return o.isoformat()
+    if isinstance(o, Path):
+        return str(o)
     return str(o)
 
 
 def save_patient_json(cfg: PipelineConfig, patient_id: str,
-                       eye_meta: dict, feature_rows: List[dict]) -> Path:
-    """Patient JSON: {patient, config, meta_by_eye, features (list of dicts)}."""
+                      eye_meta: dict, feature_rows: List[dict]) -> Path:
+    """Write `<features_root>/<patient>.json`."""
     pid = str(patient_id)
     payload = {
         "patient": pid,
         "config": {
-            "mode": cfg.mode, "square_size": cfg.square_size,
-            "extracted_at": datetime.utcnow().isoformat() + "Z",
+            "mode": "aligned", "square_size": cfg.square_size,
+            "extracted_at": datetime.now(timezone.utc).isoformat(),
         },
         "meta_by_eye": eye_meta,
         "features": feature_rows,
@@ -541,7 +505,7 @@ def save_patient_json(cfg: PipelineConfig, patient_id: str,
 
 
 def load_patient_features(json_path: Path) -> pd.DataFrame:
-    """Patient JSON → feature DataFrame (feature row 리스트만)."""
+    """Patient JSON → feature DataFrame (features list only)."""
     with open(json_path, encoding="utf-8") as f:
         payload = json.load(f)
     df = pd.DataFrame(payload["features"])
@@ -551,7 +515,7 @@ def load_patient_features(json_path: Path) -> pd.DataFrame:
 
 
 def merge_patient_jsons(features_root: Path) -> pd.DataFrame:
-    """모든 patient JSON → single DataFrame."""
+    """Concatenate every per-patient JSON into one DataFrame."""
     dfs = []
     for p in sorted(features_root.glob("*.json")):
         try:
@@ -564,11 +528,11 @@ def merge_patient_jsons(features_root: Path) -> pd.DataFrame:
 
 
 # ═════════════════════════════════════════════════════════════════════
-# 7. Cleanup (mask 삭제)
+# 7. Cleanup
 # ═════════════════════════════════════════════════════════════════════
 
 def cleanup_patient_masks(cfg: PipelineConfig, patient_id: str):
-    """환자 처리 완료 후 mask/preprocessed 삭제 (JSON 만 남김)."""
+    """Delete preprocessed / inference / aligned trees for one patient (JSON stays)."""
     pid = str(patient_id)
     for base in [cfg.prep_root, cfg.inference_root, cfg.aligned_root]:
         d = base / pid
@@ -585,7 +549,6 @@ def _inventory_cache_path(cfg: PipelineConfig, pid: str) -> Path:
 
 
 def _all_masks_exist(cfg: PipelineConfig, pid: str, rows: pd.DataFrame) -> bool:
-    """rows 의 모든 stem 에 대해 vessels/av/discs mask 파일이 있는지."""
     inf_dir = cfg.inference_root / pid
     for _, r in rows.iterrows():
         stem = Path(r[cfg.col_filename]).stem
@@ -596,48 +559,51 @@ def _all_masks_exist(cfg: PipelineConfig, pid: str, rows: pd.DataFrame) -> bool:
 
 
 def run_patient(cfg: PipelineConfig, models: dict, device, eyeliner,
-                 patient_id: str, rows: pd.DataFrame,
-                 verbose: bool = True, force: bool = False) -> Optional[Path]:
-    """한 환자에 대해 전체 파이프라인 실행 → JSON 저장 경로 반환.
+                patient_id: str, rows: pd.DataFrame,
+                verbose: bool = True, force: bool = False) -> Optional[Path]:
+    """Run the full pipeline for one patient. Returns the JSON path, or None on failure.
 
-    자동 스킵/캐시:
-      - `<features_root>/<pid>.json` 존재 → 즉시 반환 (force=True 로 override)
-      - `<inference_root>/<pid>/inventory.csv` + 모든 mask 파일 존재
-        → preprocess + inference 스킵 (registration + feature 만 재실행)
-
-    실패 시 None, 이미 완료된 JSON 존재 시 그 경로 반환.
+    Automatic skip / cache:
+      - If `<features_root>/<pid>.json` exists → return immediately (use force=True to override).
+      - If `<inference_root>/<pid>/inventory.csv` + every mask file exists
+        → skip preprocess + inference; only re-run registration + feature extraction.
     """
     pid = str(patient_id)
     out_json = cfg.features_root / f"{pid}.json"
 
     if out_json.exists() and not force:
-        if verbose: print(f"[{pid}] JSON 존재 → 스킵 ({out_json.name})")
+        if verbose:
+            print(f"[{pid}] JSON already exists → skip ({out_json.name})")
         return out_json
 
     inv_cache = _inventory_cache_path(cfg, pid)
 
-    # 1. preprocess + inference (캐시 있으면 스킵)
     if inv_cache.exists() and _all_masks_exist(cfg, pid, rows):
         inv = pd.read_csv(inv_cache, parse_dates=["date"])
-        if verbose: print(f"[{pid}] inventory + masks 캐시 재사용")
+        if verbose:
+            print(f"[{pid}] reusing cached inventory + masks")
     else:
         ids = preprocess_patient(cfg, pid, rows)
         if len(ids) == 0:
-            if verbose: print(f"[{pid}] no images"); return None
+            if verbose:
+                print(f"[{pid}] no images")
+            return None
         inf_dfs = infer_patient(cfg, models, pid, ids, device)
         inv = build_inventory(cfg, pid, rows, inf_dfs)
         if len(inv) == 0:
-            if verbose: print(f"[{pid}] inventory empty"); return None
+            if verbose:
+                print(f"[{pid}] inventory empty")
+            return None
         inv_cache.parent.mkdir(parents=True, exist_ok=True)
         inv.to_csv(inv_cache, index=False)
 
-    # 3. per-eye pipeline
     eye_meta = {}
     feature_rows = []
     for eye in ["L", "R"]:
         visits = inv[inv["eye"] == eye].to_dict("records")
         if len(visits) < cfg.min_visits_per_eye:
-            if verbose: print(f"[{pid}/{eye}] {len(visits)} visits (skip)")
+            if verbose:
+                print(f"[{pid}/{eye}] {len(visits)} visits (skip)")
             continue
 
         reg_records = register_group(cfg, eyeliner, device, visits, pid, eye)
@@ -652,15 +618,14 @@ def run_patient(cfg: PipelineConfig, models: dict, device, eyeliner,
                 feature_rows.append(feat)
 
     if not feature_rows:
-        if verbose: print(f"[{pid}] no features extracted")
+        if verbose:
+            print(f"[{pid}] no features extracted")
         return None
 
-    # 4. save JSON
     out_path = save_patient_json(cfg, pid, eye_meta, feature_rows)
     if verbose:
         print(f"[{pid}] saved {out_path.name} ({len(feature_rows)} visits, {len(eye_meta)} eyes)")
 
-    # 5. cleanup
     if not cfg.keep_masks:
         cleanup_patient_masks(cfg, pid)
 
