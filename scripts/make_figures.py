@@ -35,7 +35,28 @@ DOCS        = _PKG_ROOT / "docs"
 PATIENT     = "SAMPLE"
 EYE         = "R"
 SQUARE_SIZE = 512
-FIG_H       = 3.6   # uniform panel height across all figures (inches)
+FIG_H       = 3.6                 # uniform panel height (inches)
+CANVAS_W    = FIG_H * 4           # every figure uses this canvas → identical rendered height
+
+
+def _centered_axes(n_panels, extra_right_in=0.0, has_axes_labels=False):
+    """Return (fig, [axes]) centered on a CANVAS_W × FIG_H canvas.
+
+    extra_right_in: reserve this much extra width on the right (e.g. for a legend).
+    has_axes_labels: True if any panel has visible xticks/ylabels; adds bottom + left pad.
+    """
+    fig = plt.figure(figsize=(CANVAS_W, FIG_H))
+    panel_w = FIG_H
+    gap     = 0.35 if has_axes_labels else 0.08
+    content_w = n_panels * panel_w + (n_panels - 1) * gap + extra_right_in
+    left_pad  = (CANVAS_W - content_w) / 2
+    bottom, height = (0.14, 0.72) if has_axes_labels else (0.04, 0.84)
+    axes = []
+    for i in range(n_panels):
+        left_in = left_pad + i * (panel_w + gap)
+        axes.append(fig.add_axes([left_in / CANVAS_W, bottom,
+                                   panel_w / CANVAS_W, height]))
+    return fig, axes
 
 
 def _resolve_rgb_dir() -> Path:
@@ -87,15 +108,14 @@ def fig01_vascx_masks(rgb_dir: Path, inf_dir: Path):
     ves = np.array(Image.open(inf_dir / "vessels" / f"{vid}.png"))
     dsc = np.array(Image.open(inf_dir / "discs"   / f"{vid}.png"))
 
-    fig, axes = plt.subplots(1, 4, figsize=(FIG_H * 4, FIG_H))
+    fig, axes = _centered_axes(4)
     axes[0].imshow(rgb);              axes[0].set_title("RGB")
     axes[1].imshow(ves, cmap="gray"); axes[1].set_title("Vessels")
     axes[2].imshow(_av_rgb(av));      axes[2].set_title("AV")
     axes[3].imshow(dsc, cmap="gray"); axes[3].set_title("Disc")
     for ax in axes:
         ax.axis("off")
-    fig.tight_layout()
-    fig.savefig(DOCS / "01_vascx_masks.png", dpi=130, bbox_inches="tight")
+    fig.savefig(DOCS / "01_vascx_masks.png", dpi=130)
     plt.close(fig)
 
 
@@ -113,7 +133,7 @@ def fig02_laterality(payload, rgb_dir: Path):
     first_vid = payload["features"][0]["id"]
     rgb = np.array(Image.open(rgb_dir / f"{first_vid}.png"))
 
-    fig, ax = plt.subplots(figsize=(FIG_H, FIG_H))
+    fig, (ax,) = _centered_axes(1)
     ax.imshow(rgb)
     ax.plot([fx, dcx], [fy, dcy], color="yellow", linewidth=1.5, alpha=0.8)
     ax.scatter(fx, fy, s=120, marker="x", color="lime", linewidths=2.2, label="fovea")
@@ -123,8 +143,7 @@ def fig02_laterality(payload, rgb_dir: Path):
     ax.axis("off")
     ax.legend(loc="lower right", facecolor="black", labelcolor="white",
               framealpha=0.6, fontsize=8)
-    fig.tight_layout()
-    fig.savefig(DOCS / "02_laterality.png", dpi=130, bbox_inches="tight")
+    fig.savefig(DOCS / "02_laterality.png", dpi=130)
     plt.close(fig)
 
 
@@ -142,6 +161,20 @@ def _overlay_rb(gray_fixed, gray_moving):
     return out
 
 
+def _get_theta_for(vid: str):
+    """Load theta (3x3) from the notebook-produced registration_log.csv if present."""
+    import pandas as pd
+    log_path = SAMPLE_ROOT / f"aligned_{SQUARE_SIZE}" / "registration_log.csv"
+    if not log_path.exists():
+        return None
+    reg = pd.read_csv(log_path)
+    row = reg[reg["id"] == vid]
+    if len(row) == 0:
+        return None
+    cols = [f"t{i}{j}" for i in range(3) for j in range(3)]
+    return row.iloc[0][cols].values.astype(np.float64).reshape(3, 3)
+
+
 def fig03_registration(payload, rgb_dir: Path, aligned_dir: Path):
     import cv2
     feats = payload["features"]
@@ -150,34 +183,37 @@ def fig03_registration(payload, rgb_dir: Path, aligned_dir: Path):
 
     fixed_rgb  = np.array(Image.open(rgb_dir / f"{fixed_vid}.png"))
     moving_rgb = np.array(Image.open(rgb_dir / f"{moving_vid}.png"))
+    H, W = fixed_rgb.shape[:2]
 
-    fixed_gray  = cv2.cvtColor(fixed_rgb,  cv2.COLOR_RGB2GRAY)
-    moving_gray = cv2.cvtColor(moving_rgb, cv2.COLOR_RGB2GRAY)
+    theta = _get_theta_for(moving_vid)
+    if theta is not None:
+        moving_rgb_aligned = cv2.warpAffine(
+            moving_rgb, theta[:2, :], (W, H),
+            flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+        )
+    else:
+        moving_rgb_aligned = moving_rgb
 
-    # Aligned vessel masks give us a clean "after" comparison. For the "before"
-    # we overlay the raw moving RGB on the fixed RGB (same canvas, no warp).
-    fixed_vess = np.array(Image.open(aligned_dir / "vessels" / f"{fixed_vid}.png")) > 0
-    moving_vess_aligned = np.array(Image.open(aligned_dir / "vessels" / f"{moving_vid}.png")) > 0
+    fixed_gray         = cv2.cvtColor(fixed_rgb,          cv2.COLOR_RGB2GRAY)
+    moving_gray        = cv2.cvtColor(moving_rgb,         cv2.COLOR_RGB2GRAY)
+    moving_gray_align  = cv2.cvtColor(moving_rgb_aligned, cv2.COLOR_RGB2GRAY)
 
     before = _overlay_rb(fixed_gray, moving_gray)
+    after  = _overlay_rb(fixed_gray, moving_gray_align)
 
-    H, W = fixed_vess.shape
-    after = np.zeros((H, W, 3), dtype=np.uint8)
-    after[..., 0] = 220 * fixed_vess.astype(np.uint8)
-    after[..., 1] = 220 * moving_vess_aligned.astype(np.uint8)
-
+    fixed_vess          = np.array(Image.open(aligned_dir / "vessels" / f"{fixed_vid}.png"))  > 0
+    moving_vess_aligned = np.array(Image.open(aligned_dir / "vessels" / f"{moving_vid}.png")) > 0
     dice = (2 * (fixed_vess & moving_vess_aligned).sum() /
             max(int(fixed_vess.sum()) + int(moving_vess_aligned.sum()), 1))
 
-    fig, axes = plt.subplots(1, 2, figsize=(FIG_H * 2, FIG_H))
+    fig, axes = _centered_axes(2)
     axes[0].imshow(before)
     axes[0].set_title("Before")
     axes[1].imshow(after)
     axes[1].set_title(f"After  ·  Dice = {dice:.3f}")
     for ax in axes:
         ax.axis("off")
-    fig.tight_layout()
-    fig.savefig(DOCS / "03_registration.png", dpi=130, bbox_inches="tight")
+    fig.savefig(DOCS / "03_registration.png", dpi=130)
     plt.close(fig)
 
 
@@ -188,17 +224,14 @@ def fig03_registration(payload, rgb_dir: Path, aligned_dir: Path):
 def fig04_aligned_timeline(payload, aligned_dir: Path):
     feats = payload["features"]
     n = len(feats)
-    fig, axes = plt.subplots(1, n, figsize=(FIG_H * n, FIG_H))
-    if n == 1:
-        axes = [axes]
+    fig, axes = _centered_axes(n)
     for i, (ax, v) in enumerate(zip(axes, feats)):
         av = np.array(Image.open(aligned_dir / "av" / f"{v['id']}.png"))
         ax.imshow(_av_rgb(av))
         tag = "fixed" if i == 0 else f"visit {i + 1}"
         ax.set_title(tag)
         ax.axis("off")
-    fig.tight_layout()
-    fig.savefig(DOCS / "04_aligned_timeline.png", dpi=130, bbox_inches="tight")
+    fig.savefig(DOCS / "04_aligned_timeline.png", dpi=130)
     plt.close(fig)
 
 
@@ -235,7 +268,7 @@ def fig05_zones(payload, rgb_dir: Path):
         disp[mask] = disp[mask] * 0.6 + c * 0.4
     disp = disp.clip(0, 255).astype(np.uint8)
 
-    fig, ax = plt.subplots(figsize=(FIG_H, FIG_H))
+    fig, (ax,) = _centered_axes(1, extra_right_in=1.3)
     ax.imshow(disp)
     ax.scatter(fx, fy, s=100, marker="x", color="white", linewidths=1.8)
     ax.scatter(dcx, dcy, s=100, marker="o", facecolors="none",
@@ -243,10 +276,9 @@ def fig05_zones(payload, rgb_dir: Path):
     ax.axis("off")
 
     handles = [Patch(color=np.array(c) / 255, label=n) for n, c in ZONE_COLORS.items()]
-    ax.legend(handles=handles, loc="center left", bbox_to_anchor=(1.0, 0.5),
+    ax.legend(handles=handles, loc="center left", bbox_to_anchor=(1.02, 0.5),
               fontsize=7, framealpha=0.9)
-    fig.tight_layout()
-    fig.savefig(DOCS / "05_zones.png", dpi=130, bbox_inches="tight")
+    fig.savefig(DOCS / "05_zones.png", dpi=130)
     plt.close(fig)
 
 
@@ -260,7 +292,7 @@ def fig06_features(payload, aligned_dir: Path):
     fx, fy = meta["fovea_x"], meta["fovea_y"]
     radii = list(range(10, 240, 5))
 
-    fig, (ax_mask, ax_curve) = plt.subplots(1, 2, figsize=(FIG_H * 2, FIG_H))
+    fig, (ax_mask, ax_curve) = _centered_axes(2, has_axes_labels=True)
 
     fixed_vid = feats[0]["id"]
     ves = np.array(Image.open(aligned_dir / "vessels" / f"{fixed_vid}.png")) > 0
@@ -285,8 +317,7 @@ def fig06_features(payload, aligned_dir: Path):
     ax_curve.grid(alpha=0.3)
     ax_curve.legend(fontsize=8)
 
-    fig.tight_layout()
-    fig.savefig(DOCS / "06_features.png", dpi=130, bbox_inches="tight")
+    fig.savefig(DOCS / "06_features.png", dpi=130)
     plt.close(fig)
 
 
