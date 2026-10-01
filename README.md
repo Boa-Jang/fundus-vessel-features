@@ -98,13 +98,10 @@ Python 3.11, CUDA GPU.
 
 ```powershell
 pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
-pip install rtnls_inference rtnls_fundusprep   # Eyened inference framework
 pip install -r requirements.txt
 ```
 
-VascX itself is **not** installed via pip — it lives in this repo:
-- `vascx_models/` and `EyeLiner/` are bundled locally (no install needed)
-- VascX model weights (~2.2 GB) — download from [Google Drive](https://drive.google.com/drive/folders/1HxpYj-v7D0KX9f0ocvePgG9KT60ElQJh?usp=drive_link) → `weights/vascx/`
+VascX model weights (~2.2 GB) — download from [Google Drive](https://drive.google.com/drive/folders/1HxpYj-v7D0KX9f0ocvePgG9KT60ElQJh?usp=drive_link) → `weights/vascx/`.
 
 ---
 
