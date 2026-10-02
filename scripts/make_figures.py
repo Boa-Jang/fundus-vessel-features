@@ -130,7 +130,8 @@ def fig02_laterality(payload, rgb_dir: Path):
     fx, fy = meta["fovea_x"], meta["fovea_y"]
     dcx, dcy = meta["disc_cx"], meta["disc_cy"]
     sep = dcx - fx
-    eye_label = "L (OS)" if sep > 0 else "R (OD)"
+    # Convention: disc on image RIGHT (sep > 0) → OD (R).
+    eye_label = "R (OD)" if sep > 0 else "L (OS)"
 
     first_vid = payload["features"][0]["id"]
     rgb = np.array(Image.open(rgb_dir / f"{first_vid}.png"))

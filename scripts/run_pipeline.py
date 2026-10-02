@@ -102,8 +102,8 @@ def parse_args():
                    help="only process these patient IDs (space-separated); default: every patient in the CSV")
     p.add_argument("--top-n", type=int, default=None,
                    help="only the top-N patients by visit count (mutually exclusive with --patient-ids)")
-    p.add_argument("--min-visits", type=int, default=2,
-                   help="skip any eye with fewer than this many visits")
+    p.add_argument("--min-visits", type=int, default=1,
+                   help="skip any eye with fewer than this many visits (1 = single-visit allowed, identity registration)")
 
     p.add_argument("--force", action="store_true",
                    help="re-extract even if <features_root>/<pid>.json already exists")

@@ -2,7 +2,7 @@
 
 파이프라인 단계:
 1. Preprocess (원본 → RGB + CE, SQUARE_SIZE)
-2. VascX 추론 (7 model: quality, av, vessels, disc, fovea, discedge, odfd)
+2. VascX inference (6 models: quality, av, vessels, disc, fovea, odfd)  # discedge disabled
 3. Inventory 구축 (eye side, fovea, disc geometry, quality)
 4. Registration (aligned 모드) 또는 identity (naive 모드)
 5. Feature 추출 (241 features × visit)
@@ -86,7 +86,7 @@ class PipelineConfig:
 
     # Filtering
     patient_ids: Optional[List[str]] = None   # None → 전체
-    min_visits_per_eye: int = 2               # 이 이하는 스킵 (registration 불가)
+    min_visits_per_eye: int = 1               # 이 미만은 스킵. 1 visit 이면 registration 은 identity.
 
     # EyeLiner
     el_size: int = 256
@@ -119,9 +119,12 @@ class PipelineConfig:
 # ═════════════════════════════════════════════════════════════════════
 
 def load_vascx_models(cfg: PipelineConfig):
-    """7 개 ensemble 로드 + square_size override.
+    """Load 6 ensembles + square_size override.
 
-    Returns: dict {"quality", "av", "vessels", "disc", "fovea", "discedge", "odfd"}.
+    Returns: dict {"quality", "av", "vessels", "disc", "fovea", "odfd"}.
+
+    Note: discedge disabled — disc mask centroid is almost always reliable, so the
+    keypoint-based fallback is unused in practice. Uncomment below to re-enable.
     """
     from rtnls_inference import (
         ClassificationEnsemble, SegmentationEnsemble,
@@ -136,10 +139,10 @@ def load_vascx_models(cfg: PipelineConfig):
         "vessels":  SegmentationEnsemble.from_release(str(w / "vessels_july24.pt")).to(device).eval(),
         "disc":     SegmentationEnsemble.from_release(str(w / "disc_july24.pt")).to(device).eval(),
         "fovea":    HeatmapRegressionEnsemble.from_release(str(w / "fovea_july24.pt")).to(device).eval(),
-        "discedge": HeatmapRegressionEnsemble.from_release(str(w / "discedge_july24.pt")).to(device).eval(),
+        # "discedge": HeatmapRegressionEnsemble.from_release(str(w / "discedge_july24.pt")).to(device).eval(),
         "odfd":     RegressionEnsemble.from_release(str(w / "odfd_march25.pt")).to(device).eval(),
     }
-    for name in ["av", "vessels", "disc", "fovea", "discedge", "odfd"]:
+    for name in ["av", "vessels", "disc", "fovea", "odfd"]:  # "discedge" excluded
         tt = models[name].config["datamodule"].setdefault("test_transform", {})
         tt["square_size"] = cfg.square_size
         tt.setdefault("resize", cfg.square_size)
@@ -190,11 +193,12 @@ def infer_patient(cfg: PipelineConfig, models: dict, patient_id: str,
     ce_paths     = [ce_dir  / f"{i}.png" for i in ids]
     paired_paths = [(str(r), str(c)) for r, c in zip(rgb_paths, ce_paths)]
 
-    # 4-1 keypoints (RGB+CE 페어)
+    # 4-1 keypoints (RGB+CE paired)
     df_fovea    = models["fovea"].predict_preprocessed(paired_paths, ids=ids, num_workers=2, batch_size=8)
     df_fovea.columns = ["x_fovea", "y_fovea"]
-    df_discedge = models["discedge"].predict_preprocessed(paired_paths, ids=ids, num_workers=2, batch_size=8)
-    df_discedge.columns = ["x_discedge", "y_discedge"]
+    # discedge disabled — disc mask centroid replaces it
+    # df_discedge = models["discedge"].predict_preprocessed(paired_paths, ids=ids, num_workers=2, batch_size=8)
+    # df_discedge.columns = ["x_discedge", "y_discedge"]
 
     # 4-2 scalar (RGB only)
     df_odfd = models["odfd"].predict_preprocessed([str(p) for p in rgb_paths], ids=ids, num_workers=2, batch_size=8)
@@ -222,7 +226,7 @@ def infer_patient(cfg: PipelineConfig, models: dict, patient_id: str,
     models["disc"].predict_preprocessed(paired_paths, ids=ids, dest_path=inf_dir/"discs",
                                          num_workers=2, batch_size=8)
 
-    return dict(fovea=df_fovea, discedge=df_discedge, odfd=df_odfd, quality=df_quality)
+    return dict(fovea=df_fovea, odfd=df_odfd, quality=df_quality)
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -244,10 +248,11 @@ def disc_geometry(disc_mask: np.ndarray, min_area_px: int = 50) -> dict:
 
 
 def determine_laterality(x_fovea: float, x_disc: float, W: int, min_frac: float = 0.02) -> Tuple[str, float]:
+    # Convention: disc on image RIGHT (x_disc > x_fovea) → OD (R).
     sep = x_disc - x_fovea
     if abs(sep) < min_frac * W:
         return "unknown", sep
-    return ("L" if sep > 0 else "R"), sep
+    return ("R" if sep > 0 else "L"), sep
 
 
 def build_inventory(cfg: PipelineConfig, patient_id: str, rows: pd.DataFrame,
@@ -257,28 +262,27 @@ def build_inventory(cfg: PipelineConfig, patient_id: str, rows: pd.DataFrame,
     inf_dir = cfg.inference_root / pid
     W = cfg.square_size
 
-    df_fovea = inf_dfs["fovea"]; df_discedge = inf_dfs["discedge"]
+    df_fovea = inf_dfs["fovea"]
     df_odfd = inf_dfs["odfd"];   df_quality = inf_dfs["quality"]
 
     out_rows = []
     for _, r in rows.iterrows():
         stem = Path(r[cfg.col_filename]).stem
-        if stem not in df_fovea.index or stem not in df_discedge.index:
+        if stem not in df_fovea.index:
             continue
         fx, fy = df_fovea.loc[stem, ["x_fovea", "y_fovea"]]
 
+        # disc center: mask centroid only (discedge fallback removed)
         disc_mask_p = inf_dir / "discs" / f"{stem}.png"
         if disc_mask_p.exists():
             dg = disc_geometry(np.array(Image.open(disc_mask_p)))
         else:
             dg = dict(cx=np.nan, cy=np.nan, diameter=np.nan, area_px=0, found=False)
 
-        if dg["found"]:
-            dx, dy, disc_source = dg["cx"], dg["cy"], "mask"
-        else:
-            dx = float(df_discedge.loc[stem, "x_discedge"])
-            dy = float(df_discedge.loc[stem, "y_discedge"])
-            disc_source = "keypoint_fallback"
+        if not dg["found"]:
+            # mask empty or too small → skip this image
+            continue
+        dx, dy, disc_source = dg["cx"], dg["cy"], "mask"
 
         eye, sep = determine_laterality(float(fx), dx, W)
         q = df_quality.loc[stem].tolist() if stem in df_quality.index else [np.nan]*3
