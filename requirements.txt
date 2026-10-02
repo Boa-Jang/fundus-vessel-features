@@ -1,0 +1,35 @@
+# FundusAlign pipeline — Python 3.11 (CUDA GPU)
+# Install torch separately first (CUDA-specific wheel):
+#   pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu128
+# Then:
+#   pip install -r requirements.txt
+
+# ── Core numerical ─────────────────────────────────────────
+numpy>=1.26,<2.1
+pandas>=2.0
+scipy>=1.11
+scikit-image>=0.22
+
+# ── Image I/O ──────────────────────────────────────────────
+Pillow>=10.0
+opencv-python>=4.8
+
+# ── VascX inference + preprocess (retinalysis toolbox) ────
+retinalysis-inference>=0.5.0
+retinalysis-fundusprep>=0.6.0
+
+# ── EyeLiner registration deps (eyeliner/ bundled in repo) ─
+kornia>=0.8.0
+packaging>=23.0
+
+# ── Plotting / viz ────────────────────────────────────────
+matplotlib>=3.8
+
+# ── Caching ───────────────────────────────────────────────
+pyarrow>=15.0
+
+# ── Progress bars ─────────────────────────────────────────
+tqdm>=4.65
+
+# ── Jupyter notebooks (optional) ──────────────────────────
+ipykernel>=6.0
