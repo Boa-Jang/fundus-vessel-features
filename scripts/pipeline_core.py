@@ -650,54 +650,59 @@ def run_patient(cfg: PipelineConfig, models: dict, device, eyeliner,
         return out_json
 
     inv_cache = _inventory_cache_path(cfg, pid)
+    out_path = None
 
-    # 1. preprocess + inference (캐시 있으면 스킵)
-    if inv_cache.exists() and _all_masks_exist(cfg, pid, rows):
-        inv = pd.read_csv(inv_cache, parse_dates=["date"])
-        if verbose: print(f"[{pid}] inventory + masks 캐시 재사용")
-    else:
-        ids = preprocess_patient(cfg, pid, rows)
-        if len(ids) == 0:
-            if verbose: print(f"[{pid}] no images"); return None
-        inf_dfs = infer_patient(cfg, models, pid, ids, device)
-        inv = build_inventory(cfg, pid, rows, inf_dfs)
-        if len(inv) == 0:
-            if verbose: print(f"[{pid}] inventory empty"); return None
-        inv_cache.parent.mkdir(parents=True, exist_ok=True)
-        inv.to_csv(inv_cache, index=False)
+    try:
+        # 1. preprocess + inference (캐시 있으면 스킵)
+        if inv_cache.exists() and _all_masks_exist(cfg, pid, rows):
+            inv = pd.read_csv(inv_cache, parse_dates=["date"])
+            if verbose: print(f"[{pid}] inventory + masks 캐시 재사용")
+        else:
+            ids = preprocess_patient(cfg, pid, rows)
+            if len(ids) == 0:
+                if verbose: print(f"[{pid}] no images")
+                return None
+            inf_dfs = infer_patient(cfg, models, pid, ids, device)
+            inv = build_inventory(cfg, pid, rows, inf_dfs)
+            if len(inv) == 0:
+                if verbose: print(f"[{pid}] inventory empty")
+                return None
+            inv_cache.parent.mkdir(parents=True, exist_ok=True)
+            inv.to_csv(inv_cache, index=False)
 
-    # 3. per-eye pipeline
-    eye_meta = {}
-    feature_rows = []
-    for eye in ["L", "R"]:
-        visits = inv[inv["eye"] == eye].to_dict("records")
-        if len(visits) < cfg.min_visits_per_eye:
-            if verbose: print(f"[{pid}/{eye}] {len(visits)} visits (skip)")
-            continue
+        # 3. per-eye pipeline
+        eye_meta = {}
+        feature_rows = []
+        for eye in ["L", "R"]:
+            visits = inv[inv["eye"] == eye].to_dict("records")
+            if len(visits) < cfg.min_visits_per_eye:
+                if verbose: print(f"[{pid}/{eye}] {len(visits)} visits (skip)")
+                continue
 
-        reg_records = register_group(cfg, eyeliner, device, visits, pid, eye)
-        zones, common_valid, whole_valid, meta = build_zones_and_valid(cfg, pid, eye, reg_records, inv)
-        if zones is None:
-            continue
-        eye_meta[eye] = meta
+            reg_records = register_group(cfg, eyeliner, device, visits, pid, eye)
+            zones, common_valid, whole_valid, meta = build_zones_and_valid(cfg, pid, eye, reg_records, inv)
+            if zones is None:
+                continue
+            eye_meta[eye] = meta
 
-        for v in reg_records:
-            feat = extract_features_for_visit(cfg, pid, eye, v, zones,
-                                                common_valid, whole_valid, meta)
-            if feat is not None:
-                feature_rows.append(feat)
+            for v in reg_records:
+                feat = extract_features_for_visit(cfg, pid, eye, v, zones,
+                                                    common_valid, whole_valid, meta)
+                if feat is not None:
+                    feature_rows.append(feat)
 
-    if not feature_rows:
-        if verbose: print(f"[{pid}] no features extracted")
-        return None
+        if not feature_rows:
+            if verbose: print(f"[{pid}] no features extracted")
+            return None
 
-    # 4. save JSON
-    out_path = save_patient_json(cfg, pid, eye_meta, feature_rows)
-    if verbose:
-        print(f"[{pid}] saved {out_path.name} ({len(feature_rows)} visits, {len(eye_meta)} eyes)")
+        # 4. save JSON
+        out_path = save_patient_json(cfg, pid, eye_meta, feature_rows)
+        if verbose:
+            print(f"[{pid}] saved {out_path.name} ({len(feature_rows)} visits, {len(eye_meta)} eyes)")
 
-    # 5. cleanup
-    if not cfg.keep_masks:
-        cleanup_patient_masks(cfg, pid)
+        return out_path
 
-    return out_path
+    finally:
+        # 5. cleanup — on both success and failure (prevents orphans)
+        if not cfg.keep_masks:
+            cleanup_patient_masks(cfg, pid)
