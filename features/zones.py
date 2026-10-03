@@ -88,10 +88,13 @@ def make_etdrs_9subfields(
     wedge_left  = (ang_deg >= 135) | (ang_deg < -135)
 
     # eye 에 따라 left/right → nasal/temporal 매핑
-    if eye == "L":
-        # Left eye: disc 는 이미지 오른쪽에 있음 → 오른쪽 wedge = Nasal
+    # 본 파이프라인 convention: disc 가 이미지 R 쪽에 있으면 eye="R" (OD), L 쪽에 있으면 eye="L" (OS)
+    # Nasal 은 항상 disc 쪽, Temporal 은 반대쪽.
+    if eye == "R":
+        # Right eye: disc 는 이미지 오른쪽 → 오른쪽 wedge = Nasal
         wedge_nasal, wedge_temporal = wedge_right, wedge_left
-    else:  # eye == "R"
+    else:  # eye == "L"
+        # Left eye: disc 는 이미지 왼쪽 → 왼쪽 wedge = Nasal
         wedge_nasal, wedge_temporal = wedge_left, wedge_right
 
     return {
