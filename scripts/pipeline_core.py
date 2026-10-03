@@ -165,7 +165,9 @@ def preprocess_patient(cfg: PipelineConfig, patient_id: str, rows: pd.DataFrame)
     rgb_dir.mkdir(parents=True, exist_ok=True)
     ce_dir.mkdir(parents=True, exist_ok=True)
 
-    files = [cfg.src_images_dir / fn for fn in rows[cfg.col_filename]]
+    # Same patient may appear across multiple cohort groups → dedup by filename.
+    unique_fns = rows[cfg.col_filename].drop_duplicates().tolist()
+    files = [cfg.src_images_dir / fn for fn in unique_fns]
     ids   = [f.stem for f in files]
     existing = {p.stem for p in rgb_dir.glob("*.png")}
     todo = [f for f in files if f.stem not in existing]
@@ -264,6 +266,9 @@ def build_inventory(cfg: PipelineConfig, patient_id: str, rows: pd.DataFrame,
 
     df_fovea = inf_dfs["fovea"]
     df_odfd = inf_dfs["odfd"];   df_quality = inf_dfs["quality"]
+
+    # Drop duplicate rows (same patient across multiple cohort groups).
+    rows = rows.drop_duplicates(subset=[cfg.col_filename])
 
     out_rows = []
     for _, r in rows.iterrows():
